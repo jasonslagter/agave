@@ -2,18 +2,14 @@
 use qualifier_attr::field_qualifiers;
 use {
     crate::{
-        account_overrides::AccountOverrides,
-        nonce_info::NonceInfo,
-        rollback_accounts::RollbackAccounts,
-        transaction_error_metrics::TransactionErrorMetrics,
+        account_overrides::AccountOverrides, nonce_info::NonceInfo,
+        rollback_accounts::RollbackAccounts, transaction_error_metrics::TransactionErrorMetrics,
         transaction_execution_result::ExecutedTransaction,
-        transaction_processing_callback::{AccountState, TransactionProcessingCallback},
     },
     ahash::{AHashMap, AHashSet},
     solana_account::{
         Account, AccountSharedData, ReadableAccount, WritableAccount, PROGRAM_OWNERS,
     },
-    solana_feature_set::{self as feature_set, FeatureSet},
     solana_fee_structure::FeeDetails,
     solana_instruction::{BorrowedAccountMeta, BorrowedInstruction},
     solana_instructions_sysvar::construct_instructions_data,
@@ -24,20 +20,19 @@ use {
     },
     solana_pubkey::Pubkey,
     solana_rent::RentDue,
+    solana_rent_collector::{CollectedInfo, RENT_EXEMPT_RENT_EPOCH},
     solana_rent_debits::RentDebits,
-    solana_sdk::rent_collector::{CollectedInfo, RENT_EXEMPT_RENT_EPOCH},
     solana_sdk_ids::{
         native_loader,
         sysvar::{self, slot_history},
     },
+    solana_svm_callback::{AccountState, TransactionProcessingCallback},
+    solana_svm_feature_set::SVMFeatureSet,
     solana_svm_rent_collector::svm_rent_collector::SVMRentCollector,
     solana_svm_transaction::svm_message::SVMMessage,
     solana_transaction_context::{IndexOfAccount, TransactionAccount},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
-    std::{
-        num::{NonZeroU32, Saturating},
-        sync::Arc,
-    },
+    std::num::{NonZeroU32, Saturating},
 };
 
 // for the load instructions
@@ -60,13 +55,9 @@ pub(crate) enum TransactionLoadResult {
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
-#[cfg_attr(
-    feature = "svm-internal",
-    field_qualifiers(nonce(pub), lamports_per_signature(pub),)
-)]
+#[cfg_attr(feature = "svm-internal", field_qualifiers(nonce(pub)))]
 pub struct CheckedTransactionDetails {
     pub(crate) nonce: Option<NonceInfo>,
-    pub(crate) lamports_per_signature: u64,
     pub(crate) compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
 }
 
@@ -75,12 +66,11 @@ impl Default for CheckedTransactionDetails {
     fn default() -> Self {
         Self {
             nonce: None,
-            lamports_per_signature: 0,
             compute_budget_and_limits: Ok(SVMTransactionExecutionAndFeeBudgetLimits {
                 budget: SVMTransactionExecutionBudget::default(),
                 loaded_accounts_data_size_limit: NonZeroU32::new(32)
                     .expect("Failed to set loaded_accounts_bytes"),
-                priority_fee: 0,
+                fee_details: FeeDetails::default(),
             }),
         }
     }
@@ -89,12 +79,10 @@ impl Default for CheckedTransactionDetails {
 impl CheckedTransactionDetails {
     pub fn new(
         nonce: Option<NonceInfo>,
-        lamports_per_signature: u64,
         compute_budget_and_limits: Result<SVMTransactionExecutionAndFeeBudgetLimits>,
     ) -> Self {
         Self {
             nonce,
-            lamports_per_signature,
             compute_budget_and_limits,
         }
     }
@@ -163,13 +151,13 @@ pub struct FeesOnlyTransaction {
 pub(crate) struct AccountLoader<'a, CB: TransactionProcessingCallback> {
     account_cache: AHashMap<Pubkey, AccountSharedData>,
     callbacks: &'a CB,
-    pub(crate) feature_set: Arc<FeatureSet>,
+    pub(crate) feature_set: &'a SVMFeatureSet,
 }
 impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
     pub(crate) fn new_with_account_cache_capacity(
         account_overrides: Option<&'a AccountOverrides>,
         callbacks: &'a CB,
-        feature_set: Arc<FeatureSet>,
+        feature_set: &'a SVMFeatureSet,
         capacity: usize,
     ) -> AccountLoader<'a, CB> {
         let mut account_cache = AHashMap::with_capacity(capacity);
@@ -300,12 +288,12 @@ impl<'a, CB: TransactionProcessingCallback> AccountLoader<'a, CB> {
 /// whether rent is enabled, set the rent epoch to u64::MAX if the account is
 /// rent exempt.
 pub fn collect_rent_from_account(
-    feature_set: &FeatureSet,
+    feature_set: &SVMFeatureSet,
     rent_collector: &dyn SVMRentCollector,
     address: &Pubkey,
     account: &mut AccountSharedData,
 ) -> CollectedInfo {
-    if !feature_set.is_active(&feature_set::disable_rent_fees_collection::id()) {
+    if !feature_set.disable_rent_fees_collection {
         rent_collector.collect_rent(address, account)
     } else {
         // When rent fee collection is disabled, we won't collect rent for any account. If there
@@ -504,7 +492,7 @@ fn load_transaction_accounts<CB: TransactionProcessingCallback>(
 
             if !account_loader
                 .feature_set
-                .is_active(&feature_set::remove_accounts_executable_flag_checks::id())
+                .remove_accounts_executable_flag_checks
                 && !program_account.executable()
             {
                 error_metrics.invalid_program_for_execution += 1;
@@ -543,7 +531,7 @@ fn load_transaction_accounts<CB: TransactionProcessingCallback>(
                     if !native_loader::check_id(owner_account.owner())
                         || (!account_loader
                             .feature_set
-                            .is_active(&feature_set::remove_accounts_executable_flag_checks::id())
+                            .remove_accounts_executable_flag_checks
                             && !owner_account.executable())
                     {
                         error_metrics.invalid_program_for_execution += 1;
@@ -593,7 +581,7 @@ fn load_transaction_account<CB: TransactionProcessingCallback>(
     } else if let Some(mut loaded_account) = account_loader.load_account(account_key, is_writable) {
         loaded_account.rent_collected = if is_writable {
             collect_rent_from_account(
-                &account_loader.feature_set,
+                account_loader.feature_set,
                 rent_collector,
                 account_key,
                 &mut loaded_account.account,
@@ -678,16 +666,14 @@ fn construct_instructions_account(message: &impl SVMMessage) -> AccountSharedDat
 mod tests {
     use {
         super::*,
-        crate::{
-            transaction_account_state_info::TransactionAccountStateInfo,
-            transaction_processing_callback::TransactionProcessingCallback,
-        },
+        crate::transaction_account_state_info::TransactionAccountStateInfo,
+        agave_reserved_account_keys::ReservedAccountKeys,
         solana_account::{Account, AccountSharedData, ReadableAccount, WritableAccount},
         solana_epoch_schedule::EpochSchedule,
-        solana_feature_set::FeatureSet,
         solana_hash::Hash,
         solana_instruction::{AccountMeta, Instruction},
         solana_keypair::Keypair,
+        solana_loader_v3_interface::state::UpgradeableLoaderState,
         solana_message::{
             compiled_instruction::CompiledInstruction,
             v0::{LoadedAddresses, LoadedMessage},
@@ -695,25 +681,24 @@ mod tests {
         },
         solana_native_token::{sol_to_lamports, LAMPORTS_PER_SOL},
         solana_nonce::{self as nonce, versions::Versions as NonceVersions},
-        solana_program::bpf_loader_upgradeable::UpgradeableLoaderState,
         solana_program_runtime::execution_budget::{
             DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT, MAX_LOADED_ACCOUNTS_DATA_SIZE_BYTES,
         },
         solana_pubkey::Pubkey,
         solana_rent::Rent,
+        solana_rent_collector::{RentCollector, RENT_EXEMPT_RENT_EPOCH},
         solana_rent_debits::RentDebits,
-        solana_reserved_account_keys::ReservedAccountKeys,
-        solana_sdk::rent_collector::{RentCollector, RENT_EXEMPT_RENT_EPOCH},
         solana_sdk_ids::{
             bpf_loader, bpf_loader_upgradeable, native_loader, system_program, sysvar,
         },
         solana_signature::Signature,
         solana_signer::Signer,
+        solana_svm_callback::{InvokeContextCallback, TransactionProcessingCallback},
         solana_system_transaction::transfer,
         solana_transaction::{sanitized::SanitizedTransaction, Transaction},
         solana_transaction_context::{TransactionAccount, TransactionContext},
         solana_transaction_error::{TransactionError, TransactionResult as Result},
-        std::{borrow::Cow, cell::RefCell, collections::HashMap, fs::File, io::Read, sync::Arc},
+        std::{borrow::Cow, cell::RefCell, collections::HashMap, fs::File, io::Read},
     };
 
     #[derive(Clone, Default)]
@@ -722,7 +707,10 @@ mod tests {
         #[allow(clippy::type_complexity)]
         inspected_accounts:
             RefCell<HashMap<Pubkey, Vec<(Option<AccountSharedData>, /* is_writable */ bool)>>>,
+        feature_set: SVMFeatureSet,
     }
+
+    impl InvokeContextCallback for TestCallbacks {}
 
     impl TransactionProcessingCallback for TestCallbacks {
         fn account_matches_owners(&self, _account: &Pubkey, _owners: &[Pubkey]) -> Option<usize> {
@@ -756,7 +744,7 @@ mod tests {
             AccountLoader::new_with_account_cache_capacity(
                 None,
                 callbacks,
-                Arc::<FeatureSet>::default(),
+                &callbacks.feature_set,
                 0,
             )
         }
@@ -767,9 +755,9 @@ mod tests {
         accounts: &[TransactionAccount],
         rent_collector: &RentCollector,
         error_metrics: &mut TransactionErrorMetrics,
-        feature_set: &mut FeatureSet,
+        mut feature_set: SVMFeatureSet,
     ) -> TransactionLoadResult {
-        feature_set.deactivate(&feature_set::disable_rent_fees_collection::id());
+        feature_set.disable_rent_fees_collection = false;
         let sanitized_tx = SanitizedTransaction::from_transaction_for_tests(tx);
         let fee_payer_account = accounts[0].1.clone();
         let mut accounts_map = HashMap::new();
@@ -781,7 +769,7 @@ mod tests {
             ..Default::default()
         };
         let mut account_loader: AccountLoader<TestCallbacks> = (&callbacks).into();
-        account_loader.feature_set = Arc::new(feature_set.clone());
+        account_loader.feature_set = &feature_set;
         load_transaction(
             &mut account_loader,
             &sanitized_tx,
@@ -795,16 +783,6 @@ mod tests {
             error_metrics,
             rent_collector,
         )
-    }
-
-    /// get a feature set with all features activated
-    /// with the optional except of 'exclude'
-    fn all_features_except(exclude: Option<&[Pubkey]>) -> FeatureSet {
-        let mut features = FeatureSet::all_enabled();
-        if let Some(exclude) = exclude {
-            features.active.retain(|k, _v| !exclude.contains(k));
-        }
-        features
     }
 
     fn new_unchecked_sanitized_message(message: Message) -> SanitizedMessage {
@@ -824,22 +802,7 @@ mod tests {
             accounts,
             &RentCollector::default(),
             error_metrics,
-            &mut FeatureSet::all_enabled(),
-        )
-    }
-
-    fn load_accounts_with_excluded_features(
-        tx: Transaction,
-        accounts: &[TransactionAccount],
-        error_metrics: &mut TransactionErrorMetrics,
-        exclude_features: Option<&[Pubkey]>,
-    ) -> TransactionLoadResult {
-        load_accounts_with_features_and_rent(
-            tx,
-            accounts,
-            &RentCollector::default(),
-            error_metrics,
-            &mut all_features_except(exclude_features),
+            SVMFeatureSet::all_enabled(),
         )
     }
 
@@ -905,8 +868,13 @@ mod tests {
             instructions,
         );
 
-        let loaded_accounts =
-            load_accounts_with_excluded_features(tx, &accounts, &mut error_metrics, None);
+        let loaded_accounts = load_accounts_with_features_and_rent(
+            tx,
+            &accounts,
+            &RentCollector::default(),
+            &mut error_metrics,
+            SVMFeatureSet::all_enabled(),
+        );
 
         assert_eq!(error_metrics.account_not_found.0, 0);
         match &loaded_accounts {
@@ -983,14 +951,14 @@ mod tests {
             instructions,
         );
 
-        let mut feature_set = FeatureSet::all_enabled();
-        feature_set.deactivate(&feature_set::remove_accounts_executable_flag_checks::id());
+        let mut feature_set = SVMFeatureSet::all_enabled();
+        feature_set.remove_accounts_executable_flag_checks = false;
         let load_results = load_accounts_with_features_and_rent(
             tx,
             &accounts,
             &RentCollector::default(),
             &mut error_metrics,
-            &mut feature_set,
+            feature_set,
         );
 
         assert_eq!(error_metrics.invalid_program_for_execution.0, 1);
@@ -1041,8 +1009,13 @@ mod tests {
             instructions,
         );
 
-        let loaded_accounts =
-            load_accounts_with_excluded_features(tx, &accounts, &mut error_metrics, None);
+        let loaded_accounts = load_accounts_with_features_and_rent(
+            tx,
+            &accounts,
+            &RentCollector::default(),
+            &mut error_metrics,
+            SVMFeatureSet::all_enabled(),
+        );
 
         assert_eq!(error_metrics.account_not_found.0, 0);
         match &loaded_accounts {
@@ -1074,10 +1047,11 @@ mod tests {
             accounts_map,
             ..Default::default()
         };
+        let feature_set = SVMFeatureSet::all_enabled();
         let mut account_loader = AccountLoader::new_with_account_cache_capacity(
             account_overrides,
             &callbacks,
-            Arc::new(FeatureSet::all_enabled()),
+            &feature_set,
             0,
         );
         load_transaction(
@@ -2099,7 +2073,7 @@ mod tests {
 
     #[test]
     fn test_collect_rent_from_account() {
-        let feature_set = FeatureSet::all_enabled();
+        let feature_set = SVMFeatureSet::all_enabled();
         let rent_collector = RentCollector {
             epoch: 1,
             ..RentCollector::default()
@@ -2121,7 +2095,7 @@ mod tests {
 
     #[test]
     fn test_collect_rent_from_account_rent_paying() {
-        let feature_set = FeatureSet::all_enabled();
+        let feature_set = SVMFeatureSet::all_enabled();
         let rent_collector = RentCollector {
             epoch: 1,
             ..RentCollector::default()
@@ -2143,8 +2117,8 @@ mod tests {
 
     #[test]
     fn test_collect_rent_from_account_rent_enabled() {
-        let feature_set =
-            all_features_except(Some(&[feature_set::disable_rent_fees_collection::id()]));
+        let mut feature_set = SVMFeatureSet::all_enabled();
+        feature_set.disable_rent_fees_collection = false;
         let rent_collector = RentCollector {
             epoch: 1,
             ..RentCollector::default()
@@ -2347,14 +2321,10 @@ mod tests {
         let mut program_accounts = HashMap::new();
         program_accounts.insert(program1, (&loader_v2, 0));
         program_accounts.insert(program2, (&loader_v3, 0));
-
+        let feature_set = SVMFeatureSet::default();
         let test_transaction_data_size = |transaction, expected_size| {
-            let mut account_loader = AccountLoader::new_with_account_cache_capacity(
-                None,
-                &mock_bank,
-                Arc::<FeatureSet>::default(),
-                0,
-            );
+            let mut account_loader =
+                AccountLoader::new_with_account_cache_capacity(None, &mock_bank, &feature_set, 0);
 
             let loaded_transaction_accounts = load_transaction_accounts(
                 &mut account_loader,

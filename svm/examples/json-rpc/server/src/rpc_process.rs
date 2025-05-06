@@ -3,6 +3,7 @@ use {
         create_executable_environment, LoadAndExecuteTransactionsOutput, MockBankCallback,
         MockForkGraph, TransactionBatch,
     },
+    agave_reserved_account_keys::ReservedAccountKeys,
     base64::{prelude::BASE64_STANDARD, Engine},
     bincode::config::Options,
     jsonrpc_core::{types::error, Error, Metadata, Result},
@@ -37,7 +38,6 @@ use {
         },
         nonce::state::DurableNonce,
         pubkey::Pubkey,
-        reserved_account_keys::ReservedAccountKeys,
         signature::Signature,
         system_instruction, sysvar,
         transaction::{
@@ -333,7 +333,6 @@ impl JsonRpcRequestProcessor {
                     enable_log_recording: true,
                     enable_return_data_recording: true,
                 },
-                transaction_account_lock_limit: Some(64),
             },
         );
 
@@ -426,7 +425,6 @@ impl JsonRpcRequestProcessor {
         /* for now just return defaults */
         Ok(CheckedTransactionDetails::new(
             None,
-            u64::default(),
             Ok(SVMTransactionExecutionAndFeeBudgetLimits::default()),
         ))
     }
@@ -546,8 +544,7 @@ impl JsonRpcRequestProcessor {
             blockhash,
             blockhash_lamports_per_signature: lamports_per_signature,
             epoch_total_stake: 0,
-            feature_set: Arc::clone(&bank.feature_set),
-            fee_lamports_per_signature: lamports_per_signature,
+            feature_set: bank.feature_set.runtime_features(),
             rent_collector: None,
         };
 

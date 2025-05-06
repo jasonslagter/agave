@@ -1,23 +1,23 @@
 use {
-    super::{DiskIndexValue, IndexValue, RefCount, SlotList, ZeroLamport},
-    crate::bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
-    log::*,
+    super::{AtomicRefCount, DiskIndexValue, IndexValue, RefCount, SlotList},
+    crate::{
+        bucket_map_holder::{Age, AtomicAge, BucketMapHolder},
+        is_zero_lamport::IsZeroLamport,
+    },
     solana_clock::Slot,
     std::sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
 };
 
-pub type AccountMapEntry<T> = Arc<AccountMapEntryInner<T>>;
-
 /// one entry in the in-mem accounts index
 /// Represents the value for an account key in the in-memory accounts index
 #[derive(Debug, Default)]
-pub struct AccountMapEntryInner<T> {
+pub struct AccountMapEntry<T> {
     /// number of alive slots that contain >= 1 instances of account data for this pubkey
     /// where alive represents a slot that has not yet been removed by clean via AccountsDB::clean_stored_dead_slots() for containing no up to date account information
-    ref_count: AtomicU64,
+    ref_count: AtomicRefCount,
     /// list of slots in which this pubkey was updated
     /// Note that 'clean' removes outdated entries (ie. older roots) from this slot_list
     /// purge_slot() also removes non-rooted slots from this list
@@ -26,11 +26,11 @@ pub struct AccountMapEntryInner<T> {
     pub meta: AccountMapEntryMeta,
 }
 
-impl<T: IndexValue> AccountMapEntryInner<T> {
+impl<T: IndexValue> AccountMapEntry<T> {
     pub fn new(slot_list: SlotList<T>, ref_count: RefCount, meta: AccountMapEntryMeta) -> Self {
         Self {
             slot_list: RwLock::new(slot_list),
-            ref_count: AtomicU64::new(ref_count),
+            ref_count: AtomicRefCount::new(ref_count),
             meta,
         }
     }
@@ -49,9 +49,10 @@ impl<T: IndexValue> AccountMapEntryInner<T> {
     pub fn unref(&self) -> RefCount {
         let previous = self.ref_count.fetch_sub(1, Ordering::Release);
         self.set_dirty(true);
-        if previous == 0 {
-            inc_new_counter_info!("accounts_index-deref_from_0", 1);
-        }
+        assert_ne!(
+            previous, 0,
+            "decremented ref count when already zero: {self:?}"
+        );
         previous
     }
 
@@ -122,11 +123,11 @@ impl AccountMapEntryMeta {
 
 /// can be used to pre-allocate structures for insertion into accounts index outside of lock
 pub enum PreAllocatedAccountMapEntry<T: IndexValue> {
-    Entry(AccountMapEntry<T>),
+    Entry(Arc<AccountMapEntry<T>>),
     Raw((Slot, T)),
 }
 
-impl<T: IndexValue> ZeroLamport for PreAllocatedAccountMapEntry<T> {
+impl<T: IndexValue> IsZeroLamport for PreAllocatedAccountMapEntry<T> {
     fn is_zero_lamport(&self) -> bool {
         match self {
             PreAllocatedAccountMapEntry::Entry(entry) => {
@@ -169,11 +170,11 @@ impl<T: IndexValue> PreAllocatedAccountMapEntry<T> {
         slot: Slot,
         account_info: T,
         storage: &Arc<BucketMapHolder<T, U>>,
-    ) -> AccountMapEntry<T> {
+    ) -> Arc<AccountMapEntry<T>> {
         let is_cached = account_info.is_cached();
-        let ref_count = u64::from(!is_cached);
+        let ref_count = RefCount::from(!is_cached);
         let meta = AccountMapEntryMeta::new_dirty(storage, is_cached);
-        Arc::new(AccountMapEntryInner::new(
+        Arc::new(AccountMapEntry::new(
             vec![(slot, account_info)],
             ref_count,
             meta,
@@ -183,7 +184,7 @@ impl<T: IndexValue> PreAllocatedAccountMapEntry<T> {
     pub fn into_account_map_entry<U: DiskIndexValue + From<T> + Into<T>>(
         self,
         storage: &Arc<BucketMapHolder<T, U>>,
-    ) -> AccountMapEntry<T> {
+    ) -> Arc<AccountMapEntry<T>> {
         match self {
             Self::Entry(entry) => entry,
             Self::Raw((slot, account_info)) => Self::allocate(slot, account_info, storage),

@@ -22,7 +22,7 @@ use {
         consensus::{tower_storage::FileTowerStorage, Tower, SWITCH_FORK_THRESHOLD},
         validator::{is_snapshot_config_valid, ValidatorConfig},
     },
-    solana_gossip::gossip_service::discover_cluster,
+    solana_gossip::gossip_service::discover_validators,
     solana_ledger::{
         ancestor_iterator::AncestorIterator,
         blockstore::{Blockstore, PurgeType},
@@ -386,9 +386,10 @@ pub fn run_cluster_partition<C>(
         &cluster.connection_cache,
     );
 
-    let cluster_nodes = discover_cluster(
+    let cluster_nodes = discover_validators(
         &cluster.entry_point_info.gossip().unwrap(),
         num_nodes,
+        cluster.entry_point_info.shred_version(),
         SocketAddrSpace::Unspecified,
     )
     .unwrap();
@@ -537,11 +538,9 @@ impl SnapshotValidatorConfig {
     pub fn new(
         full_snapshot_archive_interval_slots: Slot,
         incremental_snapshot_archive_interval_slots: Slot,
-        accounts_hash_interval_slots: Slot,
         num_account_paths: usize,
     ) -> SnapshotValidatorConfig {
         // Interval values must be nonzero
-        assert!(accounts_hash_interval_slots > 0);
         assert!(full_snapshot_archive_interval_slots > 0);
         assert!(incremental_snapshot_archive_interval_slots > 0);
         // Ensure that some snapshots will be created
@@ -564,10 +563,7 @@ impl SnapshotValidatorConfig {
             maximum_incremental_snapshot_archives_to_retain: NonZeroUsize::new(usize::MAX).unwrap(),
             ..SnapshotConfig::default()
         };
-        assert!(is_snapshot_config_valid(
-            &snapshot_config,
-            accounts_hash_interval_slots
-        ));
+        assert!(is_snapshot_config_valid(&snapshot_config));
 
         // Create the account paths
         let (account_storage_dirs, account_storage_paths) =
@@ -577,7 +573,6 @@ impl SnapshotValidatorConfig {
         let validator_config = ValidatorConfig {
             snapshot_config,
             account_paths: account_storage_paths,
-            accounts_hash_interval_slots,
             ..ValidatorConfig::default_for_test()
         };
 
@@ -598,7 +593,6 @@ pub fn setup_snapshot_validator_config(
     SnapshotValidatorConfig::new(
         snapshot_interval_slots,
         DISABLED_SNAPSHOT_ARCHIVE_INTERVAL,
-        snapshot_interval_slots,
         num_account_paths,
     )
 }
